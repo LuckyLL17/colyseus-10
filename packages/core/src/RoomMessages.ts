@@ -38,12 +38,14 @@ const OUTCOME_NONE = 0, OUTCOME_REJECTED = 1, OUTCOME_RESOLVED = 2;
  */
 class DispatchContext implements MessageContext {
   readonly id: number | undefined;
+  readonly signal: AbortSignal | undefined;
   _outcome = OUTCOME_NONE;
   _reason: any = undefined;
   _value: any = undefined;
 
-  constructor(id: number | undefined) {
+  constructor(id: number | undefined, signal?: AbortSignal) {
     this.id = id;
+    this.signal = signal;
   }
 
   reject(reason?: any): any {
@@ -68,13 +70,53 @@ const SEND_CONTEXT: MessageContext = Object.freeze({
 });
 
 /**
+ * Policy for a request whose `requestId` is already pending from the SAME
+ * client (a retry before the first attempt answered):
+ *
+ * - `"allow"` (default) — every frame is dispatched independently. Matches
+ *   the historical behavior; the handler runs again and both replies go out,
+ *   the client correlating each to its own registration.
+ * - `"idempotent"` — the duplicate is NOT dispatched: it is coalesced onto
+ *   the in-flight attempt. When that settles, the SAME response is sent to
+ *   every coalesced wait, so a retried non-idempotent-looking call (charge,
+ *   spawn) executes once. A cancel from any wait drops just that wait; if the
+ *   originating request cancels, the shared attempt is abandoned (its signal
+ *   aborts) and remaining waits are released without a reply (their own
+ *   timeout/close handles them).
+ * - `"reject"` — the duplicate is refused before the handler runs with a
+ *   {@link ResponseStatus.DUPLICATE} reply echoing the id.
+ */
+export type DuplicateRequestPolicy = "allow" | "idempotent" | "reject";
+
+/** Server-side bookkeeping for one in-flight ROOM_REQUEST. */
+interface PendingRequest {
+  /** The client/correlation pair this attempt answers. Under
+   *  `"idempotent"` a coalesced retry appends its own pair so the shared
+   *  response fans out to every wait; under `"allow"` every attempt has
+   *  exactly one. Kept as a list (rather than keying the registry by id)
+   *  because `"allow"` permits concurrent same-id attempts. */
+  waiters: Array<{ client: Client & ClientPrivate, requestId: number }>;
+  /** Aborts when the request is cancelled (client timeout/abort/close) —
+   *  surfaced to the handler as `ctx.signal`. */
+  controller: AbortController;
+  /** Settled guard — a late async resolution after cancel/reply is a no-op. */
+  settled: boolean;
+  /** Remove this attempt from its registry slot on settle. For an
+   *  idempotent attempt it owns the slot (it's the only one); under
+   *  `"allow"` the slot holds the concurrent attempts and this splices just
+   *  this one out. */
+  remove: () => void;
+}
+
+/**
  * Per-room message-routing layer, owned by {@link Room}. Owns the user-message
  * handler registry (`onMessage`/`onMessageBytes` + per-type validators) and
  * decodes/dispatches the user-message wire frames (ROOM_DATA / ROOM_REQUEST /
- * ROOM_DATA_BYTES). Room's `_onMessage` keeps the protocol/lifecycle frames
- * (JOIN/PING/LEAVE/input) and calls one of these per frame, preserving the
- * original dispatch order. Reads back into its Room only for `onUncaughtException`
- * (handler wrapping) and `roomId`/`roomName` (logging).
+ * ROOM_REQUEST_CANCEL / ROOM_DATA_BYTES). Room's `_onMessage` keeps the
+ * protocol/lifecycle frames (JOIN/PING/LEAVE/input) and calls one of these per
+ * frame, preserving the original dispatch order. Reads back into its Room only
+ * for `onUncaughtException` (handler wrapping) and `roomId`/`roomName`
+ * (logging).
  *
  * @internal
  */
@@ -91,8 +133,34 @@ export class RoomMessages {
   // null-prototype: keyed by client-supplied message type (colyseus/colyseus#951)
   validators: { [type: string]: StandardSchemaV1 } = Object.create(null);
 
+  /** Per-client in-flight requests. The outer map is keyed by wire request
+   *  id; under the default `"allow"` policy concurrent attempts with the SAME
+   *  id are stored as a list (each answers independently), while
+   *  `"idempotent"` keeps exactly one attempt per id with multiple waiters.
+   *  A WeakMap lets a GC'd client drop its map; {@link onClientLeave} is the
+   *  deterministic cleanup. */
+  #pending = new WeakMap<Client & ClientPrivate, Map<number, PendingRequest[]>>();
+
   constructor(room: Room<any>) {
     this.room = room;
+  }
+
+  /** Fetch (creating on demand) a client's pending-request map. @internal */
+  #pendingFor(client: Client & ClientPrivate): Map<number, PendingRequest[]> {
+    let map = this.#pending.get(client);
+    if (map === undefined) {
+      map = new Map();
+      this.#pending.set(client, map);
+    }
+    return map;
+  }
+
+  /** Count of handler attempts this client still has in flight (a coalesced
+   *  idempotent duplicate rides its attempt and counts ONCE). @internal */
+  #pendingCount(client: Client & ClientPrivate): number {
+    let total = 0;
+    this.#pending.get(client)?.forEach((attempts) => { total += attempts.length; });
+    return total;
   }
 
   /**
@@ -219,6 +287,36 @@ export class RoomMessages {
       ? decode.string(buffer, it)
       : decode.number(buffer, it);
 
+    const pending = this.#pendingFor(client);
+    const inFlight = pending.get(requestId);
+
+    if (inFlight !== undefined && inFlight.length > 0) {
+      const policy: DuplicateRequestPolicy = this.room.duplicateRequestPolicy;
+      if (policy === "reject") {
+        debugMessage("duplicate request #%d rejected (roomId: %s)", requestId, this.room.roomId);
+        this.#replyToRequest(client, requestId, ResponseStatus.DUPLICATE, { requestId });
+        return;
+
+      } else if (policy === "idempotent") {
+        // Share the FIRST in-flight attempt: no second dispatch, no second
+        // slot. Its eventual settle fans the same response out to every wait.
+        inFlight[0].waiters.push({ client, requestId });
+        debugMessage("duplicate request #%d coalesced (%d waiters, roomId: %s)",
+          requestId, inFlight[0].waiters.length, this.room.roomId);
+        return;
+      }
+      // "allow" falls through and pushes a second independent attempt below.
+    }
+
+    // Pending cap counts handler ATTEMPTS; a coalesced duplicate rides an
+    // existing attempt and returned above, so it can never trip the cap.
+    if (this.#pendingCount(client) >= this.room.maxPendingRequests) {
+      debugMessage("request #%d refused: pending cap %d reached (roomId: %s)",
+        requestId, this.room.maxPendingRequests, this.room.roomId);
+      this.#replyToRequest(client, requestId, ResponseStatus.BUSY, { limit: this.room.maxPendingRequests });
+      return;
+    }
+
     let message;
     try {
       message = (buffer.byteLength > it.offset)
@@ -250,7 +348,45 @@ export class RoomMessages {
       return;
     }
 
-    const ctx = new DispatchContext(requestId);
+    // Register the attempt BEFORE invoking the handler, so a synchronous
+    // handler round-tripping back into the room observes a consistent
+    // registry.
+    const controller = new AbortController();
+    const entry: PendingRequest = {
+      waiters: [{ client, requestId }],
+      controller,
+      settled: false,
+      remove: () => {}, // assigned once the attempt is in its registry slot
+    };
+    const slot = pending.get(requestId);
+    if (slot === undefined) {
+      pending.set(requestId, [entry]);
+    } else {
+      // "allow": a concurrent same-id attempt — both answer independently.
+      slot.push(entry);
+    }
+
+    // Splice only THIS attempt out; an "allow" sibling keeps the slot alive.
+    entry.remove = () => {
+      const current = pending.get(requestId);
+      if (current === undefined) { return; }
+      const idx = current.indexOf(entry);
+      if (idx !== -1) { current.splice(idx, 1); }
+      if (current.length === 0) { pending.delete(requestId); }
+    };
+
+    const ctx = new DispatchContext(requestId, controller.signal);
+
+    // Single fan-out point: this attempt's originator + every idempotent
+    // waiter receive the SAME encoded outcome. An "allow" sibling has its own.
+    // Idempotent after a cancel/settle race.
+    const settle = (status: ResponseStatus, payload?: any): void => {
+      entry.settled = true;
+      for (const waiter of entry.waiters) {
+        this.#replyToRequest(waiter.client, waiter.requestId, status, payload);
+      }
+      entry.remove();
+    };
 
     // Sync handlers reply in this tick with no promise machinery; only a thenable
     // return defers to the microtask queue. A sync throw (unwrapped handler) and an
@@ -262,32 +398,107 @@ export class RoomMessages {
       response = handler(client, message, ctx);
       if (response !== null && typeof response === 'object' && typeof response.then === 'function') {
         response.then(
-          (resolved: any) => this.#finalizeRequest(client, requestId, ctx, resolved),
+          (resolved: any) => {
+            if (!entry.settled) { this.#finalizeRequest(settle, ctx, resolved); }
+          },
           (e: any) => {
+            if (entry.settled) { return; }
             debugAndPrintError(e);
-            this.#replyToRequest(client, requestId, ResponseStatus.ERROR, toResponseError(e));
+            settle(ResponseStatus.ERROR, toResponseError(e));
           },
         );
         return;
       }
     } catch (e: any) {
       debugAndPrintError(e);
-      this.#replyToRequest(client, requestId, ResponseStatus.ERROR, toResponseError(e));
+      settle(ResponseStatus.ERROR, toResponseError(e));
       return;
     }
 
-    this.#finalizeRequest(client, requestId, ctx, response);
+    this.#finalizeRequest(settle, ctx, response);
+  }
+
+  /** Dispatch a `ROOM_REQUEST_CANCEL` frame: release a pending request from
+   *  THIS client. Under `"idempotent"` the FIRST attempt's CANCEL aborts the
+   *  shared `ctx.signal` (a cooperative handler can stop) and drops every
+   *  coalesced waiter; a later waiter's CANCEL removes just that waiter.
+   *  Under `"allow"` each concurrent same-id attempt is independent, so the
+   *  canceling client's own attempt is removed. @internal */
+  onCancel(client: Client & ClientPrivate, buffer: Buffer, it: Iterator): void {
+    const requestId = decode.number(buffer, it);
+    const pending = this.#pending.get(client);
+    const attempts = pending?.get(requestId);
+    if (attempts === undefined || attempts.length === 0) { return; } // settled/unknown
+
+    if (attempts.length > 1) {
+      // "allow": find THIS client's own attempt and drop just that one.
+      // (Coalesced idempotent retries never create extra attempts.)
+      const own = attempts.findIndex((a) => a.waiters.some((w) => w.client === client));
+      if (own === -1) { return; }
+      const [entry] = attempts.splice(own, 1);
+      entry.settled = true;
+      entry.controller.abort(new Error("request cancelled by client"));
+      if (attempts.length === 0) { pending!.delete(requestId); }
+      debugMessage("request #%d cancelled (%d still in flight, roomId: %s)",
+        requestId, attempts.length, this.room.roomId);
+      return;
+    }
+
+    const entry = attempts[0];
+    // The single attempt: it carries the originator at waiters[0] plus any
+    // idempotent retries. Originator cancel abandons the whole shared attempt;
+    // a retry's cancel drops just that waiter and lets the attempt continue.
+    const waiterIndex = entry.waiters.findIndex((w) => w.client === client);
+
+    if (waiterIndex <= 0) {
+      entry.settled = true;
+      entry.controller.abort(new Error("request cancelled by client"));
+      entry.remove();
+      debugMessage("request #%d cancelled (roomId: %s)", requestId, this.room.roomId);
+    } else {
+      entry.waiters.splice(waiterIndex, 1);
+    }
+  }
+
+  /** Drop every in-flight request owned by a client (leave / disconnect).
+   *  No replies are sent — the client's transport is gone. The handlers'
+   *  abort signals fire so cooperative async work can stop. Called by
+   *  {@link Room._onLeave} before the user's `onLeave` runs. @internal */
+  onClientLeave(client: Client & ClientPrivate): void {
+    const pending = this.#pending.get(client);
+    if (pending === undefined) { return; }
+    for (const attempts of pending.values()) {
+      for (const entry of attempts) {
+        if (!entry.settled) {
+          entry.settled = true;
+          entry.controller.abort(new Error("client left before the request completed"));
+        }
+      }
+    }
+    this.#pending.delete(client);
+  }
+
+  /** Abort all tracked requests at room disposal. @internal */
+  dispose(): void {
+    // WeakMap has no clear(); per-client maps only survive for live clients,
+    // and disposal forcibly closes every client through onClientLeave, so this
+    // is a belt-and-braces path (a room disposed outside its normal lifecycle).
+    this.#pending = new WeakMap();
   }
 
   /** Finalize a request: project the handler's outcome onto a ROOM_RESPONSE reply —
    *  `ctx.reject` → REJECTED(reason), `ctx.resolve(value)` → OK(value), else OK(return). */
-  #finalizeRequest(client: Client, requestId: number, ctx: DispatchContext, response: any): void {
+  #finalizeRequest(
+    settle: (status: ResponseStatus, payload?: any) => void,
+    ctx: DispatchContext,
+    response: any,
+  ): void {
     if (ctx._outcome === OUTCOME_REJECTED) {
-      this.#replyToRequest(client, requestId, ResponseStatus.REJECTED, ctx._reason);
+      settle(ResponseStatus.REJECTED, ctx._reason);
     } else if (ctx._outcome === OUTCOME_RESOLVED) {
-      this.#replyToRequest(client, requestId, ResponseStatus.OK, ctx._value);
+      settle(ResponseStatus.OK, ctx._value);
     } else {
-      this.#replyToRequest(client, requestId, ResponseStatus.OK, response);
+      settle(ResponseStatus.OK, response);
     }
   }
 

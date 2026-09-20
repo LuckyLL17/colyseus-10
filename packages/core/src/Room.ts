@@ -2,7 +2,7 @@ import { decode, type Iterator, $changes } from '@colyseus/schema';
 import { validateSubSteps } from './input/InputBuffer.ts';
 import type { InputAPI, DefineInputOptions, IdleDeclared } from './input/types.ts';
 import { RoomInput } from './input/RoomInput.ts';
-import { RoomMessages } from './RoomMessages.ts';
+import { RoomMessages, type DuplicateRequestPolicy } from './RoomMessages.ts';
 import { Rewind, type RewindOptions } from './Rewind.ts';
 export { type InputAccessor, type InputAPI, type NormalizedInputOptions, type ConsumeOptions, type IdleInput, type IdleContext, type SanitizeInput, type NumericFieldsOf, type DefineInputOptions, type IdleDeclared } from './input/types.ts';
 
@@ -325,6 +325,35 @@ export class Room<T extends RoomOptions = RoomOptions> {
    * @default Infinity
    */
   public maxMessagesPerSecond: number = Infinity;
+
+  /**
+   * Maximum number of UNANSWERED {@link Protocol.ROOM_REQUEST} round-trips a
+   * single client may have in flight at once. A request that would exceed the
+   * cap is refused BEFORE its handler runs with a
+   * {@link ResponseStatus.BUSY} reply (the SDK surfaces it as a `"busy"`
+   * request error), bounding the memory a slow/stuck handler — or a client
+   * that never waits for replies — can pin on the room.
+   *
+   * Coalesced idempotent duplicates ({@link duplicateRequestPolicy}) ride an
+   * existing attempt and do not count again.
+   *
+   * @default Infinity
+   */
+  public maxPendingRequests: number = Infinity;
+
+  /**
+   * How to treat a ROOM_REQUEST carrying a `requestId` that is already pending
+   * from the same client (a retry fired before the first attempt answered):
+   *
+   * - `"allow"` (default) — dispatch every frame; the handler runs again and
+   *   each attempt gets its own reply. Historical behavior.
+   * - `"idempotent"` — do NOT dispatch the duplicate: coalesce it onto the
+   *   in-flight attempt and fan that attempt's response out to every wait,
+   *   so a retried request executes exactly once.
+   * - `"reject"` — refuse the duplicate immediately with
+   *   {@link ResponseStatus.DUPLICATE} (SDK `"duplicate"` error).
+   */
+  public duplicateRequestPolicy: DuplicateRequestPolicy = "allow";
 
   /**
    * The state instance you provided to `setState()`.
@@ -2224,6 +2253,11 @@ export class Room<T extends RoomOptions = RoomOptions> {
     // drop any input accessors still held for in-flight reconnections
     this._inputController?.dispose();
 
+    // No request survives the room: abort the tracked handlers. (Clients are
+    // force-closed by disconnect() and run onClientLeave themselves; this is
+    // the deterministic backstop.)
+    this.#_messages.dispose();
+
     return await (userReturnData || Promise.resolve());
   }
 
@@ -2257,6 +2291,9 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
     } else if (code === Protocol.ROOM_REQUEST) {
       this.#_messages.onRequest(client, buffer, it);
+
+    } else if (code === Protocol.ROOM_REQUEST_CANCEL) {
+      this.#_messages.onCancel(client, buffer, it);
 
     } else if (code === Protocol.ROOM_DATA_BYTES) {
       this.#_messages.onDataBytes(client, buffer, it);
@@ -2309,6 +2346,11 @@ export class Room<T extends RoomOptions = RoomOptions> {
   }
 
   private async _onLeave(client: ExtractRoomClient<T>, code?: number): Promise<any> {
+    // Pending requests can never answer once the client is gone: release them
+    // (aborting cooperative handlers' ctx.signal) BEFORE user onLeave runs, so
+    // an async onLeave awaiting one of its own requests can't deadlock.
+    this.#_messages.onClientLeave(client as ExtractRoomClient<T> & ClientPrivate);
+
     // reconnecting check is required here to allow user to deny reconnection via onReconnect()
     const method = (code === CloseCode.CONSENTED || client.state === ClientState.RECONNECTING)
       ? this.onLeave

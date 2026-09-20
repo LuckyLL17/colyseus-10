@@ -191,9 +191,18 @@ export interface Resolution<S = unknown> { readonly [RESOLVE]: S }
  *
  * `id` is `undefined` for fire-and-forget `room.send`, and the request id for
  * `room.request`.
+ *
+ * `signal` is likewise `undefined` for `room.send`; for `room.request` it is an
+ * `AbortSignal` that aborts when the caller cancels (`options.signal`), the
+ * client-side timeout fires, or the transport tears down. A long-running handler
+ * can race it (`if (ctx.signal.aborted) …`, or `addEventListener("abort", …)`)
+ * to stop work whose reply nobody is waiting for. Aborting NEVER interrupts the
+ * handler by itself — it only cancels the delivery of whatever reply it later
+ * produces (the server drops its registration on cancel).
  */
 export interface MessageContext {
   readonly id: number | undefined;
+  readonly signal?: AbortSignal;
   /**
    * Reject this dispatch. For `room.request` → a rejected promise carrying
    * `reason`. `return ctx.reject(r)` so the reason type is inferred; a bare
