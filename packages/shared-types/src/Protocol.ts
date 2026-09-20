@@ -26,9 +26,10 @@ export const Protocol = {
   ROOM_INPUT_RELIABLE: 19,   // [byte, stamp?, ...InputEncoder.encode() bytes]       single input
   ROOM_INPUT_UNRELIABLE: 20, // [byte, len|input, len|input, ...]                    length-framed ring
 
-  // Request/response (21~22)
-  ROOM_REQUEST: 21,  // [byte, requestId varint, type(str|num), msgpack payload]     client→server, expects a reply
-  ROOM_RESPONSE: 22, // [byte, requestId varint, status uint8, msgpack payload?]     server→client, reply to a request
+  // Request/response (21~23)
+  ROOM_REQUEST: 21,        // [byte, requestId varint, type(str|num), msgpack payload]     client→server, expects a reply
+  ROOM_RESPONSE: 22,       // [byte, requestId varint, status uint8, msgpack payload?]     server→client, reply to a request
+  ROOM_REQUEST_CANCEL: 23, // [byte, requestId varint]                                     client→server, give up waiting
 } as const;
 export type Protocol = typeof Protocol[keyof typeof Protocol];
 
@@ -174,6 +175,12 @@ export const PROTOCOL_MODIFIER_MASK = 0xE0;
  * - `ERROR` → a *fault* (handler threw, or no handler registered): `faulted` on
  *   the client. Payload is a sanitized `{ name, message, code? }`, never a raw
  *   reason — so a crash can't masquerade as a typed reject.
+ * - `CAPACITY` → the room refused to *start* the request: its per-connection
+ *   pending-request limit (`room.maxPendingRequests`) was full. No handler ran.
+ * - `DUPLICATE` → the request used a `requestId` the room still considers
+ *   pending and the room's `duplicateRequestPolicy` is `"reject"` (default).
+ *   Under `"idempotent"` the duplicate frame is ignored and the single in-flight
+ *   handler's eventual reply answers both sends.
  *
  * Byte values freeze at the first 0.18 release; add statuses by appending, never
  * by renumbering.
@@ -182,6 +189,8 @@ export const ResponseStatus = {
   OK: 0,
   REJECTED: 1,
   ERROR: 2,
+  CAPACITY: 3,
+  DUPLICATE: 4,
 } as const;
 export type ResponseStatus = typeof ResponseStatus[keyof typeof ResponseStatus];
 

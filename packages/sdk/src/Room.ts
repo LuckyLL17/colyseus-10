@@ -1,4 +1,4 @@
-import { CloseCode, HandshakeSection, Protocol, PROTOCOL_CODE_MASK, PROTOCOL_MODIFIER_MASK, ProtocolModifier, ResponseStatus, type InferState, type InferInput, type NormalizeRoomType, type ExtractRoomMessages, type ExtractRoomClientMessages, type ExtractMessageType, type ExtractResponseType } from '@colyseus/shared-types';
+import { CloseCode, HandshakeSection, Protocol, PROTOCOL_CODE_MASK, PROTOCOL_MODIFIER_MASK, ProtocolModifier, type InferState, type InferInput, type NormalizeRoomType, type ExtractRoomMessages, type ExtractRoomClientMessages, type ExtractMessageType, type ExtractResponseType } from '@colyseus/shared-types';
 import { decode, Decoder, encode, Iterator, Schema } from '@colyseus/schema';
 
 import { RoomInput } from './input/RoomInput.ts';
@@ -20,7 +20,7 @@ import { SchemaConstructor, SchemaSerializer } from './serializer/SchemaSerializ
 import { NULL_CLOCK, type RoomClock } from './RoomClock.ts';
 
 import { type ReconnectionOptions, createReconnection, enqueueMessage } from './Reconnection.ts';
-import { type OnReply, type RequestOptions, toRequestError } from './RoomRequest.ts';
+import { type OnReply, type RequestOptions, RequestTimeoutError, RequestClosedError, DuplicateRequestError, RequestCapacityError, toAbortError, toResponseError } from './RoomRequest.ts';
 
 import { now } from './core/utils.ts';
 
@@ -100,14 +100,26 @@ export class Room<
     #nextRequestId: number = 0;
 
     /**
+     * Bumped on every transport `onclose`. Every pending round-trip captures the
+     * epoch it was registered under: a ROOM_RESPONSE that arrives on a NEW
+     * connection (reconnect after a drop) can never resolve a request issued on
+     * the old one — even if its monotonic id happens to be reused by a fresh
+     * request. `#pending` is also rejected + cleared on close, so this is
+     * defense-in-depth, not the primary guard. @internal
+     */
+    #connectionEpoch: number = 0;
+
+    /**
      * In-flight round-trips awaiting a {@link Protocol.ROOM_RESPONSE}, keyed by the
-     * monotonic request id. `onReply` receives the decoded outcome `(ok, payload,
-     * faulted)`; `onClose` (optional) rejects on disconnect — its absence drops the
-     * registration silently. @internal
+     * monotonic request id. `onReply` receives the raw wire `(status, payload)`;
+     * `onClose` (optional) rejects on disconnect — its absence drops the
+     * registration silently. `epoch` pins the entry to the connection that
+     * carried the request (see {@link #connectionEpoch}). @internal
      */
     #pending = new Map<number, {
         onReply: OnReply;
-        onClose?: (reason: string) => void;
+        onClose?: (code?: number, reason?: string) => void;
+        epoch: number;
     }>();
 
     /**
@@ -154,8 +166,11 @@ export class Room<
         this.connection = new Connection(options.protocol);
         this.connection.events.onmessage = this.onMessageCallback.bind(this);
         this.connection.events.onclose = (e: CloseEvent) => {
-            // the in-flight requests can't be answered on a closed socket
-            this.#rejectAllPending("connection closed before a response was received.");
+            // the in-flight requests can't be answered on a closed socket.
+            // Bump the epoch BEFORE rejecting so late frames delivered on the
+            // (possibly reconnected) next connection can't resolve these ids.
+            this.#connectionEpoch++;
+            this.#rejectAllPending(e.code, e.reason);
 
             if (this.joinedAtTime === 0) {
                 console.warn?.(`Room connection was closed unexpectedly (${e.code}): ${e.reason}`);
@@ -199,6 +214,15 @@ export class Room<
     }
 
     public leave(consented: boolean = true): Promise<number> {
+        // Nothing in flight can be answered after we leave — reject + clear now
+        // rather than waiting for the server's socket close (which, for a
+        // consented leave, only arrives after its onLeave tick). Idempotent with
+        // the onclose handler: whichever runs first clears the map.
+        this.#rejectAllPending(
+            consented ? CloseCode.CONSENTED : CloseCode.GOING_AWAY,
+            "room left before a response was received.",
+        );
+
         return new Promise((resolve) => {
             this.onLeave((code) => resolve(code));
 
@@ -309,13 +333,32 @@ export class Room<
      * Send a message and await the server's reply. The server answers by
      * returning a value from its matching `onMessage(type, ...)` handler.
      *
-     * Rejects if the handler throws, if no handler is registered, if the
-     * connection closes first, or if no reply arrives within `timeout`
-     * (defaults to {@link Room.defaultRequestTimeout}).
+     * Failure classes are distinguishable by error type so callers can retry /
+     * rethrow / back off appropriately:
+     *
+     * - **business error** — handler threw / no handler (`faulted` Error with
+     *   the server's `name`/`message`/`code`) or the handler called
+     *   `ctx.reject(reason)` (`err.name === "rejected"`, `err.reason` set).
+     * - {@link RequestCapacityError} / {@link DuplicateRequestError} — the room
+     *   refused the request before the handler ran (`maxPendingRequests` full /
+     *   duplicate id policy).
+     * - {@link RequestTimeoutError} (`err.name === "TimeoutError"`) — no reply
+     *   within `timeout` (default {@link Room.defaultRequestTimeout}).
+     * - {@link AbortError} — cancelled via `options.signal`.
+     * - {@link RequestClosedError} — the transport closed while awaiting
+     *   (leave / drop / server shutdown). Reconnection attempts do not resume
+     *   the request.
      *
      * @example
      * ```typescript
      * const profile = await room.request("get-profile", { id: 42 });
+     * ```
+     *
+     * Cancellation:
+     * ```typescript
+     * const controller = new AbortController();
+     * const promise = room.request("slow", {}, { signal: controller.signal });
+     * controller.abort(); // rejects with AbortError; server slot is released
      * ```
      */
     public request<MessageType extends keyof ExtractRoomMessages<NormalizeRoomType<T>>>(
@@ -332,24 +375,71 @@ export class Room<
         if (!this.connection.isOpen) {
             return Promise.reject(new Error(`cannot send request "${messageType}": connection is not open.`));
         }
+
+        // Pre-aborted signal: reject before encoding/transmitting anything.
+        if (options?.signal?.aborted) {
+            return Promise.reject(toAbortError(options.signal));
+        }
+
         const timeoutMs = options?.timeout ?? Room.defaultRequestTimeout;
-        // request = sendRequest + fail-fast-offline (above) + promise + timeout. The
-        // timer lives in this closure, so the shared #pending registry stays unaware
-        // of timeouts (a request-only concern); the reply callback and onClose both clear it.
+        const signal = options?.signal;
+        // request = sendRequest + fail-fast-offline (above) + promise + timeout +
+        // signal. The timer and signal listener live in this closure, so the
+        // shared #pending registry stays unaware of them; the reply callback and
+        // onClose both tear them down.
         return new Promise((resolve, reject) => {
             let timer: ReturnType<typeof setTimeout>;
+            let settled = false;
+
+            const teardown = () => {
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", onAbort);
+            };
+
+            const onAbort = () => {
+                if (settled) { return; }
+                settled = true;
+                // Best-effort server-side release: frees the pending slot and
+                // aborts the handler's ctx.signal. Safe while offline — the
+                // frame just fails to transmit (cancel is not enqueued).
+                this.#sendCancelFrame(id);
+                this.cancelRequest(id);
+                teardown();
+                reject(toAbortError(signal));
+            };
+
             const id = this.sendRequest(
                 messageType, payload, { mode: options?.mode },
-                (ok, replyPayload, faulted) => {
-                    clearTimeout(timer);
-                    if (ok) { resolve(replyPayload); }
-                    else { reject(toRequestError(replyPayload, faulted)); }
+                (status, replyPayload) => {
+                    if (settled) { return; } // timeout/abort/close won the race — drop the late reply
+                    settled = true;
+                    teardown();
+                    const error = toResponseError(status, replyPayload);
+                    if (error !== undefined) { reject(error); }
+                    else { resolve(replyPayload); }
                 },
-                (reason) => { clearTimeout(timer); reject(new Error(reason)); },
+                (code, reason) => {
+                    if (settled) { return; }
+                    settled = true;
+                    teardown();
+                    reject(new RequestClosedError(
+                        reason
+                            ? `connection closed before a response was received: ${reason}`
+                            : "connection closed before a response was received.",
+                        code, reason,
+                    ));
+                },
             );
+
+            if (signal) { signal.addEventListener("abort", onAbort); }
+
             timer = setTimeout(() => {
+                if (settled) { return; }
+                settled = true;
+                this.#sendCancelFrame(id);
                 this.cancelRequest(id);
-                reject(new Error(`request "${messageType}" timed out after ${timeoutMs}ms.`));
+                teardown();
+                reject(new RequestTimeoutError(messageType, timeoutMs));
             }, timeoutMs);
         });
     }
@@ -386,18 +476,19 @@ export class Room<
 
     /**
      * Low-level round-trip primitive: register `onReply` (called once with the
-     * decoded outcome when the server replies) and transmit a
+     * raw wire status + payload when the server replies) and transmit a
      * {@link Protocol.ROOM_REQUEST} (`mode` picks the channel). {@link request}
-     * wraps it with a promise + timeout. `onClose` (optional) is invoked on
-     * disconnect — omit it to drop the registration silently. Returns the request
-     * id, or `-1` if an unreliable send couldn't be transmitted (offline). @internal
+     * wraps it with a promise + timeout + abort signal. `onClose` (optional) is
+     * invoked on disconnect with the close code/reason — omit it to drop the
+     * registration silently. Returns the request id, or `-1` if an unreliable
+     * send couldn't be transmitted (offline). @internal
      */
     protected sendRequest(
         messageType: string | number,
         payload: any,
         opts: { mode?: "reliable" | "unreliable" },
         onReply: OnReply,
-        onClose?: (reason: string) => void,
+        onClose?: (code?: number, reason?: string) => void,
     ): number {
         const requestId = this.#mintRequestId();
 
@@ -414,21 +505,33 @@ export class Room<
             enqueueMessage(this, new Uint8Array(data));
         }
 
-        this.#pending.set(requestId, { onReply, onClose });
+        this.#pending.set(requestId, { onReply, onClose, epoch: this.#connectionEpoch });
         return requestId;
     }
 
-    /** Drop a pending round-trip (request timeout, or the predict layer's TTL/cancel
-     *  path). Idempotent. @internal */
+    /** Encode + best-effort-send a {@link Protocol.ROOM_REQUEST_CANCEL} frame.
+     *  Not enqueued while offline: a cancel for a request that never reached the
+     *  server frees nothing there, and after reconnect the request id is stale
+     *  anyway (the server dropped its pending map on disconnect). @internal */
+    #sendCancelFrame(requestId: number): void {
+        if (!this.connection.isOpen) { return; }
+        const it: Iterator = { offset: 1 };
+        this.sharedBuffer[0] = Protocol.ROOM_REQUEST_CANCEL;
+        encode.number(this.sharedBuffer, requestId, it);
+        this.connection.send(this.sharedBuffer.subarray(0, it.offset));
+    }
+
+    /** Drop a pending round-trip (request timeout/abort, or the predict layer's
+     *  TTL/cancel path). Idempotent. @internal */
     protected cancelRequest(id: number): void {
         this.#pending.delete(id);
     }
 
-    #rejectAllPending(reason: string) {
+    #rejectAllPending(code?: number, reason?: string) {
         if (this.#pending.size === 0) { return; }
-        // request entries reject (their `onClose` clears the timer); entries with no
-        // `onClose` drop silently.
-        for (const entry of this.#pending.values()) { entry.onClose?.(reason); }
+        // request entries reject (their `onClose` clears the timer/signal);
+        // entries with no `onClose` drop silently.
+        for (const entry of this.#pending.values()) { entry.onClose?.(code, reason); }
         this.#pending.clear();
     }
 
@@ -697,11 +800,14 @@ export class Room<
                 : undefined;
 
             const entry = this.#pending.get(requestId);
-            // already answered (e.g. timed out / cancelled) or unknown id — ignore
-            if (entry !== undefined) {
+            // Already settled (timed out / aborted / connection-closed), unknown
+            // id, or — critically — a LATE response riding a NEW connection whose
+            // monotonic id space has wrapped back onto this number: the epoch
+            // mismatch means it answers a request from a previous socket, so it
+            // must never resolve the current holder. Ignore.
+            if (entry !== undefined && entry.epoch === this.#connectionEpoch) {
                 this.#pending.delete(requestId);
-                // the ONE place the wire's three statuses collapse to (ok, payload, faulted):
-                entry.onReply(status === ResponseStatus.OK, payload, status === ResponseStatus.ERROR);
+                entry.onReply(status, payload);
             }
 
         } else if (code === Protocol.PING) {
@@ -725,6 +831,11 @@ export class Room<
     }
 
     private destroy () {
+        // Last-resort lifecycle cleanup: onLeave → removeAllListeners → destroy.
+        // onclose/leave() normally clear pending first; this covers rooms torn
+        // down without a socket close event.
+        this.#rejectAllPending(CloseCode.GOING_AWAY, "room disposed before a response was received.");
+
         if (this.serializer) {
             this.serializer.teardown();
         }

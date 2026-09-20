@@ -11,6 +11,14 @@ import { OnMessageException } from './errors/RoomExceptions.ts';
 import type { Client, ClientPrivate } from './Transport.ts';
 import type { Room } from './Room.ts';
 
+/** How the room treats a ROOM_REQUEST whose requestId is already pending on
+ *  that connection:
+ *  - `"reject"` (default): answer the duplicate frame immediately with
+ *    {@link ResponseStatus.DUPLICATE}; the in-flight request is untouched.
+ *  - `"idempotent"`: drop the duplicate frame silently. The single in-flight
+ *    handler's eventual reply answers both sends (both carry the same id). */
+export type DuplicateRequestPolicy = "reject" | "idempotent";
+
 /** Normalize a thrown value into the `{ name, message, code? }` shape echoed in a
  *  ROOM_RESPONSE error reply. */
 function toResponseError(e: any): { name: string; message: string; code?: any } {
@@ -30,6 +38,19 @@ function toResponseError(e: any): { name: string; message: string; code?: any } 
 const OUTCOME_NONE = 0, OUTCOME_REJECTED = 1, OUTCOME_RESOLVED = 2;
 
 /**
+ * Per-request bookkeeping for an in-flight ROOM_REQUEST. The `Map` this lives
+ * in is keyed per transport connection (see RoomMessages.#pendingByRef), so it
+ * dies with the socket: a late handler reply after disconnect / reconnect finds
+ * no slot and is dropped rather than written to a new connection.
+ *
+ * `controller` is aborted on explicit cancel (ROOM_REQUEST_CANCEL), when the
+ * connection leaves, or when the room disposes — it backs `ctx.signal`.
+ */
+interface PendingRequest {
+  controller: AbortController;
+}
+
+/**
  * Runtime {@link MessageContext} for a {@link Protocol.ROOM_REQUEST} dispatch.
  * `reject`/`resolve` record the decision on the ctx; `onRequest` reads it after the
  * handler returns, so a bare side-effecting call works as well as `return
@@ -38,12 +59,14 @@ const OUTCOME_NONE = 0, OUTCOME_REJECTED = 1, OUTCOME_RESOLVED = 2;
  */
 class DispatchContext implements MessageContext {
   readonly id: number | undefined;
+  readonly signal: AbortSignal | undefined;
   _outcome = OUTCOME_NONE;
   _reason: any = undefined;
   _value: any = undefined;
 
-  constructor(id: number | undefined) {
+  constructor(id: number | undefined, signal?: AbortSignal) {
     this.id = id;
+    this.signal = signal;
   }
 
   reject(reason?: any): any {
@@ -63,6 +86,7 @@ class DispatchContext implements MessageContext {
  *  `reject`/`resolve` go nowhere). `id` is `undefined`; zero per-message allocation. */
 const SEND_CONTEXT: MessageContext = Object.freeze({
   id: undefined,
+  signal: undefined,
   reject: () => undefined as any,
   resolve: () => undefined as any,
 });
@@ -75,6 +99,11 @@ const SEND_CONTEXT: MessageContext = Object.freeze({
  * (JOIN/PING/LEAVE/input) and calls one of these per frame, preserving the
  * original dispatch order. Reads back into its Room only for `onUncaughtException`
  * (handler wrapping) and `roomId`/`roomName` (logging).
+ *
+ * Also owns the per-connection pending-request ledger that backs the server
+ * half of request/reply: the room-wide pending cap (`room.maxPendingRequests`),
+ * duplicate-requestId policy (`room.duplicateRequestPolicy`), cancellation
+ * (ROOM_REQUEST_CANCEL), and lifecycle cleanup (client leave / room dispose).
  *
  * @internal
  */
@@ -90,6 +119,22 @@ export class RoomMessages {
    *  {@link events} (`onMessageValidators`). */
   // null-prototype: keyed by client-supplied message type (colyseus/colyseus#951)
   validators: { [type: string]: StandardSchemaV1 } = Object.create(null);
+
+  /**
+   * In-flight requests keyed by the TRANSPORT CONNECTION (`client.ref`), then by
+   * requestId. The outer WeakMap needs no explicit teardown when a socket is
+   * GC'd; the inner Map is deleted on every leave/close via
+   * {@link releaseConnection}. A new connection (post-reconnect) starts with an
+   * EMPTY ledger — a late reply keyed off the old ref can never be delivered to
+   * the new socket, even if a client reuses a requestId.
+   */
+  #pendingByRef = new WeakMap<object, Map<number, PendingRequest>>();
+
+  /** Every ledger currently in {@link #pendingByRef}. WeakMap isn't iterable, so
+   *  room-wide cleanup ({@link releaseAll} on dispose) keeps its own index.
+   *  Ledgers are unregistered once emptied, so a long-lived room doesn't
+   *  accumulate dead sets. @internal */
+  #allPending = new Set<Map<number, PendingRequest>>();
 
   constructor(room: Room<any>) {
     this.room = room;
@@ -211,7 +256,12 @@ export class RoomMessages {
    *  opted into a reply, so echo the `requestId` with the outcome. The handler's
    *  reply is decided by what it returns / does to `ctx`: `ctx.reject(reason)` →
    *  `REJECTED(reason)`, `ctx.resolve(value)` → `OK(value)`, a thrown error or
-   *  missing handler → `ERROR`, else `OK(return)`. */
+   *  missing handler → `ERROR`, else `OK(return)`.
+   *
+   *  Before dispatch the frame passes the pending ledger: a full per-connection
+   *  cap replies CAPACITY (no handler runs); a repeated requestId is either
+   *  rejected (DUPLICATE) or swallowed ("idempotent" — the in-flight reply will
+   *  answer both sends). */
   onRequest(client: Client & ClientPrivate, buffer: Buffer, it: Iterator): void {
     const requestId = decode.number(buffer, it);
 
@@ -238,6 +288,37 @@ export class RoomMessages {
       return;
     }
 
+    const pending = this.#getOrCreatePending(client);
+
+    // Duplicate requestId on this connection: policy decides.
+    if (pending.has(requestId)) {
+      if (this.room.duplicateRequestPolicy === "idempotent") {
+        // The first dispatch owns the reply; it carries the same requestId, so
+        // the duplicate sender is answered by it as well. Nothing to do.
+        debugMessage("duplicate request #%d swallowed (idempotent policy, roomId: %s)", requestId, this.room.roomId);
+        return;
+      }
+      this.#replyToRequest(client, requestId, ResponseStatus.DUPLICATE, {
+        name: "duplicate_request",
+        message: `request "${messageType}" (id ${requestId}) is already pending.`,
+        requestId,
+      });
+      return;
+    }
+
+    // Pending cap (per connection). Overflow is refused BEFORE the handler runs
+    // — replying ERROR after a handler already started would not free the slot.
+    const limit = this.room.maxPendingRequests;
+    if (Number.isFinite(limit) && pending.size >= limit) {
+      debugMessage("request #%d refused: pending cap %d reached (roomId: %s)", requestId, limit, this.room.roomId);
+      this.#replyToRequest(client, requestId, ResponseStatus.CAPACITY, {
+        name: "pending_capacity_exceeded",
+        message: `room has reached its limit of ${limit} pending requests per connection.`,
+        limit,
+      });
+      return;
+    }
+
     // Answered by the FIRST handler registered for the type (emit would discard
     // returns); wildcard handlers have no response contract, so they're ineligible.
     const handler = this.events.events[messageType as string]?.[0];
@@ -250,7 +331,9 @@ export class RoomMessages {
       return;
     }
 
-    const ctx = new DispatchContext(requestId);
+    const controller = new AbortController();
+    pending.set(requestId, { controller });
+    const ctx = new DispatchContext(requestId, controller.signal);
 
     // Sync handlers reply in this tick with no promise machinery; only a thenable
     // return defers to the microtask queue. A sync throw (unwrapped handler) and an
@@ -279,9 +362,35 @@ export class RoomMessages {
     this.#finalizeRequest(client, requestId, ctx, response);
   }
 
+  /** Dispatch a `ROOM_REQUEST_CANCEL` frame: abort the in-flight request's
+   *  {@link AbortController} (so `ctx.signal` observers in the handler stop) and
+   *  release its pending slot. Idempotent — an unknown / already-settled id is a
+   *  no-op (the reply, if it races, is discarded on the client). */
+  onCancel(client: Client & ClientPrivate, buffer: Buffer, it: Iterator): void {
+    const requestId = decode.number(buffer, it);
+    const pending = this.#pendingByRef.get(client.ref as object);
+    const entry = pending?.get(requestId);
+
+    if (entry !== undefined) {
+      debugMessage("request #%d cancelled by client (roomId: %s)", requestId, this.room.roomId);
+      entry.controller.abort();
+      this.#deletePending(pending!, requestId);
+    }
+  }
+
   /** Finalize a request: project the handler's outcome onto a ROOM_RESPONSE reply —
-   *  `ctx.reject` → REJECTED(reason), `ctx.resolve(value)` → OK(value), else OK(return). */
-  #finalizeRequest(client: Client, requestId: number, ctx: DispatchContext, response: any): void {
+   *  `ctx.reject` → REJECTED(reason), `ctx.resolve(value)` → OK(value), else OK(return).
+   *  A request already removed from the ledger (cancelled, disconnected, disposed)
+   *  settles nowhere: the slot release IS the "don't reply to a ghost" guard. */
+  #finalizeRequest(client: Client & ClientPrivate, requestId: number, ctx: DispatchContext, response: any): void {
+    const pending = this.#pendingByRef.get(client.ref as object);
+    if (pending === undefined || !pending.has(requestId)) {
+      // Cancelled by the client, the connection is gone, or the room disposed.
+      debugMessage("response #%d discarded: request no longer pending (roomId: %s)", requestId, this.room.roomId);
+      return;
+    }
+    this.#deletePending(pending, requestId);
+
     if (ctx._outcome === OUTCOME_REJECTED) {
       this.#replyToRequest(client, requestId, ResponseStatus.REJECTED, ctx._reason);
     } else if (ctx._outcome === OUTCOME_RESOLVED) {
@@ -289,6 +398,41 @@ export class RoomMessages {
     } else {
       this.#replyToRequest(client, requestId, ResponseStatus.OK, response);
     }
+  }
+
+  /**
+   * Release EVERY pending request on one transport connection — called from the
+   * Room when a client leaves (consented leave, drop, kick) and BEFORE a
+   * reconnecting client's ref is transplanted. Aborts handler signals and drops
+   * the ledger: any handler that settles afterwards finds no slot (#finalizeRequest
+   * no-ops), so a late response is never written to the replacement connection.
+   */
+  releaseConnection(client: Client & ClientPrivate): void {
+    const pending = this.#pendingByRef.get(client.ref as object);
+    if (pending === undefined) { return; }
+
+    for (const entry of pending.values()) {
+      if (!entry.controller.signal.aborted) { entry.controller.abort(); }
+    }
+    this.#allPending.delete(pending);
+    this.#pendingByRef.delete(client.ref as object);
+  }
+
+  /**
+   * Abort and discard all pending requests across ALL connections — called once
+   *  from Room disposal. Replies are not attempted (the sockets are going away;
+   *  the SDK rejects its own pending on close), but handler `ctx.signal`s abort
+   *  so async work can stop before the room tears down around it.
+   */
+  releaseAll(): void {
+    if (this.#allPending.size === 0) { return; }
+    for (const pending of this.#allPending) {
+      for (const entry of pending.values()) {
+        if (!entry.controller.signal.aborted) { entry.controller.abort(); }
+      }
+      pending.clear();
+    }
+    this.#allPending.clear();
   }
 
   /** Dispatch a `ROOM_DATA_BYTES` frame: raw bytes routed to `_$b`-prefixed handlers. */
@@ -324,8 +468,31 @@ export class RoomMessages {
     }
   }
 
+  /** Fetch (lazily creating) the pending ledger for a client's transport
+   *  connection. Keyed on `client.ref` so a reconnect (new ref) starts empty. */
+  #getOrCreatePending(client: Client & ClientPrivate): Map<number, PendingRequest> {
+    const ref = client.ref as object;
+    let pending = this.#pendingByRef.get(ref);
+    if (pending === undefined) {
+      pending = new Map();
+      this.#pendingByRef.set(ref, pending);
+      this.#allPending.add(pending);
+    }
+    return pending;
+  }
+
+  /** Remove one settled request; drop the ledger from the room-wide index once
+   *  empty so dead connections' maps don't linger (the WeakMap entry itself is
+   *  collected with the ref). */
+  #deletePending(pending: Map<number, PendingRequest>, requestId: number): void {
+    pending.delete(requestId);
+    if (pending.size === 0) {
+      this.#allPending.delete(pending);
+    }
+  }
+
   /** Emit a ROOM_RESPONSE reply immediately. */
-  #replyToRequest(client: Client, requestId: number, status: ResponseStatus, payload?: any): void {
+  #replyToRequest(client: Client & ClientPrivate, requestId: number, status: ResponseStatus, payload?: any): void {
     debugMessage("response #%d: status=%d -> %j (roomId: %s)", requestId, status, payload, this.room.roomId);
     client.enqueueRaw(getMessageBytes[Protocol.ROOM_RESPONSE](requestId, status, payload));
   }

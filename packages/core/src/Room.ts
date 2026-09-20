@@ -2,7 +2,7 @@ import { decode, type Iterator, $changes } from '@colyseus/schema';
 import { validateSubSteps } from './input/InputBuffer.ts';
 import type { InputAPI, DefineInputOptions, IdleDeclared } from './input/types.ts';
 import { RoomInput } from './input/RoomInput.ts';
-import { RoomMessages } from './RoomMessages.ts';
+import { RoomMessages, type DuplicateRequestPolicy } from './RoomMessages.ts';
 import { Rewind, type RewindOptions } from './Rewind.ts';
 export { type InputAccessor, type InputAPI, type NormalizedInputOptions, type ConsumeOptions, type IdleInput, type IdleContext, type SanitizeInput, type NumericFieldsOf, type DefineInputOptions, type IdleDeclared } from './input/types.ts';
 
@@ -325,6 +325,36 @@ export class Room<T extends RoomOptions = RoomOptions> {
    * @default Infinity
    */
   public maxMessagesPerSecond: number = Infinity;
+
+  /**
+   * Maximum number of in-flight `client.request()` calls a SINGLE connection
+   * may have awaiting a reply at once. Frames past the cap are refused with
+   * {@link ResponseStatus.CAPACITY} before any handler runs (the SDK rejects
+   * with `RequestCapacityError`). The slot is freed when the handler settles,
+   * the client cancels, or the connection leaves.
+   *
+   * Per-connection rather than room-wide: a room-wide counter would let one
+   * noisy client deny capacity to every other one. Set to a finite number to
+   * bound the memory a slow/hostile handler can pin.
+   *
+   * @default Infinity — no limit (matches the unoptioned legacy behavior)
+   */
+  public maxPendingRequests: number = Infinity;
+
+  /**
+   * How to treat a ROOM_REQUEST carrying a `requestId` the room still considers
+   * pending on that connection:
+   *
+   * - `"reject"` (default): answer the duplicate immediately with
+   *   {@link ResponseStatus.DUPLICATE} (SDK: `DuplicateRequestError`); the
+   *   in-flight handler is untouched.
+   * - `"idempotent"`: swallow the duplicate frame — the single in-flight
+   *   handler's reply (same requestId) answers both sends. Use for safe retries
+   *   of non-mutating requests.
+   *
+   * @default "reject"
+   */
+  public duplicateRequestPolicy: DuplicateRequestPolicy = "reject";
 
   /**
    * The state instance you provided to `setState()`.
@@ -1978,6 +2008,14 @@ export class Room<T extends RoomOptions = RoomOptions> {
       newClient.view = previousClient.view;
       newClient.state = ClientState.RECONNECTING;
 
+      // Drop every request pending on the OLD transport before transplanting the
+      // ref: abort their handler signals and remove the ledger keyed on it. This
+      // is the server half of "a late response can't resolve on the new
+      // connection" — post-transplant, `client.ref` is the new socket, so a
+      // late #finalizeRequest looks its requestId up on an (empty) new ledger
+      // and no-ops instead of writing to the new connection.
+      this.#_messages.releaseConnection(previousClient as unknown as Client & ClientPrivate);
+
       // for convenience: populate previous client reference with new client
       previousClient.state = ClientState.RECONNECTED;
       previousClient.ref = newClient.ref;
@@ -2224,6 +2262,11 @@ export class Room<T extends RoomOptions = RoomOptions> {
     // drop any input accessors still held for in-flight reconnections
     this._inputController?.dispose();
 
+    // Abort + discard every request still awaiting a reply across all
+    // connections (disconnect() clients leave via _onLeave, but dispose can also
+    // run with the process shutting down underneath them).
+    this.#_messages.releaseAll();
+
     return await (userReturnData || Promise.resolve());
   }
 
@@ -2257,6 +2300,9 @@ export class Room<T extends RoomOptions = RoomOptions> {
 
     } else if (code === Protocol.ROOM_REQUEST) {
       this.#_messages.onRequest(client, buffer, it);
+
+    } else if (code === Protocol.ROOM_REQUEST_CANCEL) {
+      this.#_messages.onCancel(client, buffer, it);
 
     } else if (code === Protocol.ROOM_DATA_BYTES) {
       this.#_messages.onDataBytes(client, buffer, it);
@@ -2324,6 +2370,14 @@ export class Room<T extends RoomOptions = RoomOptions> {
     // Freeze the seat: a held (reconnecting) session idles from the first tick
     // instead of replaying last-known moves.
     this._inputController?.freeze(client as unknown as ClientPrivate);
+
+    // Release this connection's in-flight requests: abort handler signals and
+    // drop the ledger. Every leave path (consented leave, drop, forcible kick,
+    // socket close) funnels through _onLeave, so this is the single place that
+    // guarantees a gone client's pending slots don't leak — and that a handler
+    // resolving afterwards can't emit a late ROOM_RESPONSE onto the closed (or a
+    // reconnect-replaced) socket. Idempotent (reconnect transplant releases too).
+    this.#_messages.releaseConnection(client as unknown as Client & ClientPrivate);
 
     if (method) {
       debugMatchMaking(`${method.name}, sessionId: \'%s\' (close code: %d, roomId: %s)`, client.sessionId, code, this.roomId);

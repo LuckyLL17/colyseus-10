@@ -4,7 +4,7 @@ export { ColyseusSDK, Client, type JoinOptions, type EndpointSettings, type Clie
 export { type FetchFn } from './HTTP.ts';
 export { Room, type InputHandle, type InputOptions } from './Room.ts';
 export type { RoomClock, RoomClockLike } from './RoomClock.ts';
-export { type RequestOptions } from './RoomRequest.ts';
+export { type RequestOptions, RequestTimeoutError, RequestClosedError, RequestCapacityError, DuplicateRequestError } from './RoomRequest.ts';
 export { Auth, type AuthSettings, type PopupSettings, type AuthResponse, type UserDataResponse, type ForgotPasswordResponse, type AuthData } from "./Auth.ts";
 export { ServerError, AbortError, MatchMakeError } from './errors/Errors.ts';
 export { CloseCode, ErrorCode, Protocol } from '@colyseus/shared-types'; // convenience re-export / backwards compatibility

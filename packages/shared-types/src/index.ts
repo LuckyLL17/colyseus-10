@@ -195,6 +195,18 @@ export interface Resolution<S = unknown> { readonly [RESOLVE]: S }
 export interface MessageContext {
   readonly id: number | undefined;
   /**
+   * Aborted when this request can no longer receive a reply: the caller
+   * cancelled it (`AbortSignal`/timeout → ROOM_REQUEST_CANCEL), the caller's
+   * connection left, or the room is disposing. Handlers doing cancellable async
+   * work (queries, fetches) may pass it through and stop early when it fires.
+   *
+   * `undefined` for fire-and-forget `room.send` (no reply channel = nothing to
+   * cancel). Never throws to observe — an aborted request still replies if the
+   * handler settles anyway; the framework just discards the reply (and releases
+   * the pending slot), so checking the signal is purely an optimization.
+   */
+  readonly signal?: AbortSignal;
+  /**
    * Reject this dispatch. For `room.request` → a rejected promise carrying
    * `reason`. `return ctx.reject(r)` so the reason type is inferred; a bare
    * `ctx.reject(r)` (no return) also rejects, with the reason typed `any`.
